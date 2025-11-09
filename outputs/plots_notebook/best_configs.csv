@@ -1,0 +1,4 @@
+policy,n_pickers,congestion,batch_size,time_threshold_min,sku_popularity,seed,throughput_per_hour,avg_wait_min,util_avg,util_max
+Batching_Size,1,off,10,0.0,concentrada,7,51.68734485757472,0.0,0.0704298280153889,0.0704298280153889
+Batching_Size,1,off,5,0.0,uniforme,7,50.13992073047456,0.0,0.1690151982581312,0.1690151982581312
+Batching_Size,1,off,10,0.0,concentrada,11,45.718694081083065,0.0,0.064291913551523,0.064291913551523

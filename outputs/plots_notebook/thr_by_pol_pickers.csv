@@ -1,0 +1,10 @@
+policy,n_pickers,throughput_per_hour
+Batching_Size,1,47.68839502479249
+Batching_Size,2,47.68839502479249
+Batching_Size,3,47.68839502479249
+Batching_Time,1,46.08626555272188
+Batching_Time,2,46.08626555272188
+Batching_Time,3,46.08626555272188
+Secuencial_FCFS,1,45.89883437399078
+Secuencial_FCFS,2,45.89883437399078
+Secuencial_FCFS,3,45.89883437399078
