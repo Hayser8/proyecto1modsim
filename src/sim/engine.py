@@ -140,8 +140,15 @@ class Simulator:
         self._picker_xy: List[Tuple[int, int]] = [(stx, sty) for _ in range(cfg.n_pickers)]
         self._picker_job: List[Optional[int]] = [None for _ in range(cfg.n_pickers)]
         self._picker_state: List[str] = ["idle" for _ in range(cfg.n_pickers)]
+
+        # Timeline final para la UI (se construye al final con tracks)
         self.trace_frames: List[dict] = []
-        self._snapshot(self.now)
+
+        # --- Tracks por picker (keyframes) ---
+        # Cada item: (t, x, y, state, job_id)
+        self._tracks: List[List[Tuple[float, int, int, str, Optional[int]]]] = [[] for _ in range(cfg.n_pickers)]
+        for pid in range(cfg.n_pickers):
+            self._tracks[pid].append((0.0, stx, sty, "idle", None))
 
         # Arribos de jobs
         for job in self.jobs:
@@ -158,6 +165,7 @@ class Simulator:
         self.analytics["queue_t"].append(float(self.now))
         self.analytics["queue_q"].append(int(len(self.waiting)))
 
+    # (quedó por compatibilidad; ya no se usa para construir timeline)
     def _snapshot(self, t: float):
         self.trace_frames.append({
             "t": float(t),
@@ -168,7 +176,38 @@ class Simulator:
             ],
         })
 
-    def _build_path_for_job(self, job: Job) -> List[Tuple[int, int]]:
+    # -------- keyframes & fusión a timeline --------
+    def _keyframe(self, pid: int, t: float, xy: Tuple[int, int], state: str, job_id: Optional[int]):
+        self._tracks[pid].append((float(t), int(xy[0]), int(xy[1]), state, job_id))
+
+    def _build_timeline_from_tracks(self, end_time: float):
+        # 1) tiempos únicos
+        times = sorted({t for track in self._tracks for (t, *_ ) in track})
+        if not times or times[0] > 0.0:
+            times = [0.0] + times
+        if not times or times[-1] < end_time:
+            times.append(float(end_time))
+
+        # 2) punteros y último estado conocido por picker
+        idx = [0] * len(self._tracks)
+        last = [self._tracks[i][0] for i in range(len(self._tracks))]
+
+        self.trace_frames = []
+        for t in times:
+            for pid, track in enumerate(self._tracks):
+                while idx[pid] + 1 < len(track) and track[idx[pid] + 1][0] <= t + 1e-12:
+                    idx[pid] += 1
+                last[pid] = track[idx[pid]]
+            self.trace_frames.append({
+                "t": float(t),
+                "pickers": [
+                    {"picker_id": pid, "x": last[pid][1], "y": last[pid][2],
+                     "state": last[pid][3], "job_id": last[pid][4]}
+                    for pid in range(len(self._tracks))
+                ],
+            })
+
+    def _build_path_for_job(self, job: Job) -> List[Tuple[float, float]]:
         orders = getattr(job, "orders", None)
         if not orders:
             return []
@@ -182,100 +221,102 @@ class Simulator:
         return float(len(path) - 1)  # 1 m por celda
 
     def _animate_job(self, pid: int, job: Job, start_t: float, duration_min: float, job_path: List[Tuple[int, int]]):
+        """Emite keyframes por picker; la fusión a frames completos se hace al final."""
         path = job_path
+
+        # Sin path (o trivial)
         if not path or len(path) < 2:
+            # mantén posición actual y crea dos keyframes
             self._picker_job[pid] = job.job_id
             self._picker_state[pid] = "moving"
-            self._snapshot(start_t)
+            self._keyframe(pid, start_t, self._picker_xy[pid], "moving", job.job_id)
             self._picker_state[pid] = "idle"
             self._picker_job[pid] = None
-            self._snapshot(start_t + duration_min)
+            self._keyframe(pid, start_t + duration_min, self._picker_xy[pid], "idle", None)
             return
 
         steps = len(path) - 1
         step_total = duration_min / steps if steps > 0 else duration_min
         dt = max(self.cfg.round_dt, 1e-6)
 
+        # estado inicial
         self._picker_job[pid] = job.job_id
         self._picker_state[pid] = "moving"
         self._picker_xy[pid] = (int(path[0][0]), int(path[0][1]))
         t = start_t
-        self._snapshot(t)
+        self._keyframe(pid, t, self._picker_xy[pid], "moving", job.job_id)
 
+        # recorrer path
         for i in range(steps):
             next_xy = (int(path[i + 1][0]), int(path[i + 1][1]))
             t_end_seg = t + step_total
 
             while t + dt < t_end_seg - 1e-9:
                 t += dt
-                self._snapshot(t)
+                self._keyframe(pid, t, self._picker_xy[pid], "moving", job.job_id)
 
             t = t_end_seg
             self._picker_xy[pid] = next_xy
-            self._snapshot(t)
+            self._keyframe(pid, t, self._picker_xy[pid], "moving", job.job_id)
 
         self._picker_state[pid] = "idle"
         self._picker_job[pid] = None
+        self._keyframe(pid, t, self._picker_xy[pid], "idle", None)
 
     def _assign_if_possible(self):
         changed_queue = False
 
-        for pid, p in enumerate(self.pickers):
-            if p.busy_until <= self.now and self.waiting:
-                job = self.waiting.popleft()
-                changed_queue = True
+        # Asignar en bucle: mientras haya cola y pickers libres al tiempo actual
+        while self.waiting:
+            free = [(pid, p) for pid, p in enumerate(self.pickers) if p.busy_until <= self.now]
+            if not free:
+                break
 
-                path = self._build_path_for_job(job)
-                self.distance_total_m += self._path_length_m(path)
+            # toma el picker libre con menor busy_until (el más “disponible”)
+            pid, p = min(free, key=lambda x: x[1].busy_until)
 
-                active = sum(1 for x in self.pickers if x.busy_until > self.now)
-                dur = job.service_min * self._congestion_multiplier(active + 1)
-                # Gantt: bloque [inicio=self.now, duración=dur] para este picker
-                self.analytics.setdefault("gantt", {}).setdefault(pid, []).append((float(self.now), float(dur)))
+            job = self.waiting.popleft()
+            changed_queue = True
 
-                # Esperas por pedido: registra cada orden del job
-                if getattr(job, "orders", None):
-                    for o in job.orders:
-                        self.analytics["waits"].append(max(0.0, float(self.now - o.arrival_min)))
-                else:
-                    self.analytics["waits"].append(max(0.0, float(self.now - job.arrival_min)))
+            # path y distancia
+            path = self._build_path_for_job(job)
+            self.distance_total_m += self._path_length_m(path)
 
-                # Esperas por pedido (una por orden)
-                if getattr(job, "orders", None):
-                    self.order_waits.extend(max(0.0, self.now - o.arrival_min) for o in job.orders)
-                else:
-                    self.order_waits.append(max(0.0, self.now - job.arrival_min))
+            # congestión (si está off, _congestion_multiplier() devuelve 1.0)
+            active = sum(1 for x in self.pickers if x.busy_until > self.now)
+            dur = job.service_min * self._congestion_multiplier(active + 1)
 
-                # Batching stats
-                if self.cfg.policy != "Secuencial_FCFS":
-                    self.batches_sizes.append(int(job.n_orders))
-                    release_min = float(job.arrival_min)
-                    self.batches_release.append(release_min)
-                    try:
-                        first_arrival = min(o.arrival_min for o in job.orders)
-                        self.batches_fill.append(max(0.0, release_min - float(first_arrival)))
-                    except Exception:
-                        pass
+            # Gantt/analytics
+            self.analytics.setdefault("gantt", {}).setdefault(pid, []).append((float(self.now), float(dur)))
 
-                # Gantt
-                self.gantt[pid].append((self.now, self.now + dur, int(job.job_id)))
+            # Espera por pedido(s)
+            if getattr(job, "orders", None):
+                for o in job.orders:
+                    wait = max(0.0, float(self.now - o.arrival_min))
+                    self.analytics["waits"].append(wait)
+                    self.order_waits.append(wait)
+            else:
+                wait = max(0.0, float(self.now - job.arrival_min))
+                self.analytics["waits"].append(wait)
+                self.order_waits.append(wait)
 
-                # Animación
-                try:
-                    self._animate_job(pid, job, start_t=self.now, duration_min=dur, job_path=path)
-                except Exception:
-                    self._picker_job[pid] = job.job_id
-                    self._picker_state[pid] = "moving"
-                    self._snapshot(self.now)
-                    self._picker_state[pid] = "idle"
-                    self._picker_job[pid] = None
-                    self._snapshot(self.now + dur)
+            # Gantt por picker (para métricas finales)
+            self.gantt[pid].append((self.now, self.now + dur, int(job.job_id)))
 
-                p.busy_until = self.now + dur
-                p.busy_time += dur
-                self.picker_tours[pid] += 1
+            # Animación con keyframes
+            try:
+                self._animate_job(pid, job, start_t=self.now, duration_min=dur, job_path=path)
+            except Exception:
+                # Fallback mínimo: dos keyframes
+                self._keyframe(pid, self.now, self._picker_xy[pid], "moving", job.job_id)
+                self._keyframe(pid, self.now + dur, self._picker_xy[pid], "idle", None)
 
-                self.evq.push(Event(time=p.busy_until, etype="PICKER_FREE", payload={"pid": pid, "job": job}))
+            # Actualiza estado del picker y agenda su evento de fin
+            p.busy_until = self.now + dur
+            p.busy_time  += dur
+            self.picker_tours[pid] += 1
+            self.evq.push(Event(time=p.busy_until, etype="PICKER_FREE",
+                                payload={"pid": pid, "job": job}))
 
         if changed_queue:
             self.ts_queue.append((self.now, len(self.waiting)))
@@ -341,6 +382,9 @@ class Simulator:
         batch_avg_fill = float(np.mean(self.batches_fill)) if self.batches_fill else 0.0
 
         self._log_queue()
+
+        # Construye timeline fusionado por tiempo para la UI
+        self._build_timeline_from_tracks(sim_time)
 
         return SimResult(
             makespan_min=sim_time,
