@@ -157,9 +157,12 @@ class Simulator:
     # ----------------------- Utilidades internas -----------------------
 
     def _congestion_multiplier(self, active_pickers: int) -> float:
-        if self.cfg.congestion == "off":
+        mode = self.cfg.congestion
+        if mode == "off":
             return 1.0
-        return 1.0 + 0.15 * max(0, active_pickers - 1)  # “light”
+        # activa desde 2 en adelante: 1 + alpha*(active-1)
+        alpha = 0.15  # “light”: ~15% por picker extra
+        return 1.0 + alpha * max(0, active_pickers -  1)
     
     def _log_queue(self):
         self.analytics["queue_t"].append(float(self.now))
