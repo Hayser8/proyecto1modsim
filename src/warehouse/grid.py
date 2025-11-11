@@ -1,60 +1,108 @@
+# src/warehouse/grid.py
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import Tuple, Iterable, Dict, Set, List
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Any
+from collections import deque, defaultdict
 
-Coord = Tuple[int, int]  # (fila, columna)
-
-@dataclass(frozen=True)
-class GridSpec:
-    rows: int                 # intersecciones de pasillo en vertical
-    cols: int                 # intersecciones de pasillo en horizontal
-    cell_size_m: float = 1.0  # metros entre intersecciones
-    packing_station: Coord = (0, 0)  # punto de empaque/entrada
-    blocked: Set[Coord] = None        # celdas bloqueadas (p.ej., zonas no transitables)
-
-    def __post_init__(self):
-        if self.rows <= 0 or self.cols <= 0:
-            raise ValueError("rows y cols deben ser > 0")
+Coord = Tuple[int, int]  # (x, y) en la grilla
 
 @dataclass
 class WarehouseGrid:
-    spec: GridSpec
+    """
+    Contenedor ligero de la grilla del CD con un 'spec' estilo dict:
 
-    def nodes(self) -> Iterable[Coord]:
-        """Todas las intersecciones transitables del grafo."""
-        b = self.spec.blocked or set()
-        for r in range(self.spec.rows):
-            for c in range(self.spec.cols):
-                if (r, c) not in b:
-                    yield (r, c)
+    spec = {
+        "width": int,
+        "height": int,
+        "station": {"x": int, "y": int},
+        "obstacles": List[List[int] | Tuple[int,int]],   # opcional
+        "cell_size_m": float                             # opcional, default 1.0
+    }
 
-    def in_bounds(self, rc: Coord) -> bool:
-        r, c = rc
-        return 0 <= r < self.spec.rows and 0 <= c < self.spec.cols
+    Esta forma coincide con lo que esperan la UI (compose_trace) y SKUPlacement.random_sample.
+    """
+    spec: Dict[str, Any]
 
-    def passable(self, rc: Coord) -> bool:
-        return rc not in (self.spec.blocked or set())
+    # --------- constructores ---------
+    @staticmethod
+    def default_spec() -> Dict[str, Any]:
+        # Ajusta si quieres otras dimensiones/obstáculos por defecto
+        return {
+            "width": 30,
+            "height": 30,
+            "station": {"x": 0, "y": 0},
+            "obstacles": [],         # lista de [x,y] o (x,y)
+            "cell_size_m": 1.0,
+        }
 
-    def neighbors(self, rc: Coord) -> Iterable[Coord]:
-        """Vecinos 4-conectados (arriba, abajo, izq, der)."""
-        r, c = rc
-        candidates = [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]
+    # --------- helpers básicos ---------
+    @property
+    def width(self) -> int:
+        return int(self.spec.get("width", 0))
+
+    @property
+    def height(self) -> int:
+        return int(self.spec.get("height", 0))
+
+    @property
+    def cell_size_m(self) -> float:
+        return float(self.spec.get("cell_size_m", 1.0))
+
+    @property
+    def station_xy(self) -> Coord:
+        st = self.spec.get("station", None)
+        if isinstance(st, dict) and "x" in st and "y" in st:
+            return int(st["x"]), int(st["y"])
+        # Fallbacks comunes
+        if isinstance(st, (tuple, list)) and len(st) == 2:
+            return int(st[0]), int(st[1])
+        return (0, 0)
+
+    @property
+    def obstacles_set(self) -> Set[Coord]:
+        raw = self.spec.get("obstacles", []) or []
+        out: Set[Coord] = set()
+        for p in raw:
+            if isinstance(p, (list, tuple)) and len(p) == 2:
+                out.add((int(p[0]), int(p[1])))
+        return out
+
+    # --------- API de grafo sobre la grilla ---------
+    def in_bounds(self, xy: Coord) -> bool:
+        x, y = xy
+        return 0 <= x < self.width and 0 <= y < self.height
+
+    def passable(self, xy: Coord) -> bool:
+        return xy not in self.obstacles_set
+
+    def neighbors(self, xy: Coord) -> Iterable[Coord]:
+        x, y = xy
+        candidates = [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
         for n in candidates:
             if self.in_bounds(n) and self.passable(n):
                 yield n
 
+    def nodes(self) -> Iterable[Coord]:
+        obs = self.obstacles_set
+        for x in range(self.width):
+            for y in range(self.height):
+                if (x, y) not in obs:
+                    yield (x, y)
+
     def edges(self) -> Iterable[Tuple[Coord, Coord]]:
-        """Aristas no dirigidas entre intersecciones adyacentes transitables."""
         seen = set()
         for u in self.nodes():
             for v in self.neighbors(u):
-                e = tuple(sorted([u, v]))
+                e = tuple(sorted((u, v)))
                 if e not in seen:
                     seen.add(e)
                     yield e
 
     def all_pairs_shortest_path_length(self) -> Dict[Coord, Dict[Coord, int]]:
-        """Distancias en pasos (no en metros). BFS por cada nodo (grilla pequeña)."""
-        from collections import deque, defaultdict
+        """
+        Distancias en pasos (Manhattan con obstáculos) por BFS desde cada nodo.
+        Útil para precalcular rutas cortas en grillas pequeñas/medianas.
+        """
         distances: Dict[Coord, Dict[Coord, int]] = {}
         nods = list(self.nodes())
         for s in nods:
@@ -70,10 +118,6 @@ class WarehouseGrid:
             distances[s] = dict(dist)
         return distances
 
+    # --------- utilidades métricas ---------
     def meters(self, steps: int) -> float:
-        return steps * self.spec.cell_size_m
-
-    @staticmethod
-    def default_spec() -> GridSpec:
-        # Por defecto: 10 pasillos x 20 intersecciones (como referencia del plan)
-        return GridSpec(rows=10, cols=20, cell_size_m=1.0, packing_station=(0, 0), blocked=set())
+        return steps * self.cell_size_m

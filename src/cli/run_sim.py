@@ -20,9 +20,11 @@ def main():
     gen = OrderGenerator(catalog, pop, OrderSpec(1,5,True), rng)
     orders = [gen.make_order(tt) for tt in t]
 
-    cfg = SimConfig(policy="Batching_Size", n_pickers=2, speed_m_per_min=60.0, batch_size=10, congestion="light")
+    cfg = SimConfig(policy="Batching_Size", n_pickers=2, speed_m_per_min=60.0,
+                batch_size=10, congestion="light", trace_dt=0.25)
     sim = Simulator(grid, placement, orders, cfg)
     res = sim.run()
+    print(f"Frames: {0 if res.frames is None else len(res.frames)}")
     print(f"Orders: {len(orders)}  Completed: {res.orders_completed}")
     print(f"Makespan: {res.makespan_min:.1f} min  Throughput: {res.throughput_per_hour:.2f} orders/h")
     print(f"Avg wait: {res.avg_wait_min:.2f} min  Util: {[round(x,2) for x in res.picker_utilization]}")
